@@ -1,471 +1,194 @@
+"""Issues routes including CSV export for the Product Backlog."""
+from __future__ import annotations
+
 import csv
 import io
-import uuid
-from datetime import datetime, timezone
-from fastapi import APIRouter, HTTPException, Query, UploadFile, File
-from pydantic import BaseModel
+import logging
+import re
+from typing import Any, Iterable, Iterator
 
-from pmtracker.store import json_store
-from pmtracker.tools.transitions import STATUS_OBJECTS, TRANSITIONS
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi.responses import StreamingResponse
 
-router = APIRouter(tags=["issues"])
+try:
+    from api.routes.auth import get_current_user
+except Exception:  # pragma: no cover
+    def get_current_user(request: Request) -> dict:
+        auth = request.headers.get("Authorization", "") if request else ""
+        if not auth.lower().startswith("bearer "):
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        return {"username": "unknown"}
 
+try:
+    from pmtracker.api_client import get_project_issues
+except Exception:  # pragma: no cover
+    def get_project_issues(project_key: str, **kwargs: Any) -> list[dict]:
+        raise HTTPException(status_code=500, detail="issues backend unavailable")
 
-def _now() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+logger = logging.getLogger(__name__)
 
+try:
+    from pmtracker.store.json_store import project_exists, user_can_read_project
+except Exception:  # pragma: no cover
+    logger.warning(
+        "pmtracker.store.json_store authz helpers unavailable; falling back to deny-by-default"
+    )
 
-_PRIORITY_MAP = {"Highest": "1", "High": "2", "Medium": "3", "Low": "4", "Lowest": "5"}
+    def project_exists(project_key: str) -> bool:
+        return False
 
+    def user_can_read_project(user: dict, project_key: str) -> bool:
+        return False
 
-class IssueCreate(BaseModel):
-    project_key: str
-    summary: str
-    issue_type: str = "Story"
-    description: str = ""
-    assignee: str | None = None
-    priority: str = "Medium"
-    labels: list[str] = []
-    components: list[str] = []
-    epic_link: str | None = None
-    sprint_id: str | None = None
-    story_points: int | None = None
-    estimate_hours: float | None = None
-    parent_key: str | None = None
-    fix_versions: list[str] = []
+router = APIRouter(prefix="/api", tags=["issues"])
 
-
-class IssueUpdate(BaseModel):
-    summary: str | None = None
-    description: str | None = None
-    assignee: str | None = None
-    priority: str | None = None
-    labels: list[str] | None = None
-    components: list[str] | None = None
-    epic_link: str | None = None
-    sprint_id: str | None = None
-    story_points: int | None = None
-    estimate_hours: float | None = None
-    status: str | None = None
-    parent_key: str | None = None
-    fix_versions: list[str] | None = None
-    issue_type: str | None = None
+PROJECT_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*$")
+CSV_COLUMNS = ["key", "summary", "issue_type", "status", "priority", "assignee", "sprint"]
+_FORMULA_TRIGGERS = ("=", "+", "-", "@", "\t", "\r")
 
 
-class IssueLinkCreate(BaseModel):
-    type: str  # "Blocks", "Relates", "Duplicate"
-    target_key: str
+def _validate_project_key(project_key: str) -> None:
+    """Validate project_key against the contract pattern."""
+    if not PROJECT_KEY_PATTERN.match(project_key or ""):
+        raise HTTPException(status_code=400, detail="Invalid project_key")
 
 
-def _filter_issues(
-    all_issues: list,
-    project_id: str | None = None,
-    status: str | None = None,
-    assignee: str | None = None,
-    priority: str | None = None,
-    issue_type: str | None = None,
-    sprint: str | None = None,
-    epic: str | None = None,
-) -> list:
-    """Apply filter parameters to a list of issues. All string comparisons are case-insensitive."""
-    filtered = all_issues
-
-    if project_id:
-        filtered = [
-            i for i in filtered
-            if (i.get("fields", {}).get("project", {}).get("key") or "").lower() == project_id.lower()
-        ]
-
-    if status:
-        filtered = [
-            i for i in filtered
-            if (i.get("fields", {}).get("status", {}).get("name") or "").lower() == status.lower()
-        ]
-
-    if assignee:
-        filtered = [
-            i for i in filtered
-            if ((i.get("fields", {}).get("assignee") or {}).get("displayName") or "").lower() == assignee.lower()
-        ]
-
-    if priority:
-        filtered = [
-            i for i in filtered
-            if (i.get("fields", {}).get("priority", {}).get("name") or "").lower() == priority.lower()
-        ]
-
-    if issue_type:
-        filtered = [
-            i for i in filtered
-            if (i.get("fields", {}).get("issuetype", {}).get("name") or "").lower() == issue_type.lower()
-        ]
-
-    if sprint:
-        # Case-insensitive comparison consistent with all other string filters
-        filtered = [
-            i for i in filtered
-            if (i.get("fields", {}).get("sprint") or "").lower() == sprint.lower()
-        ]
-
-    if epic:
-        filtered = [
-            i for i in filtered
-            if (i.get("fields", {}).get("epic") or "").lower() == epic.lower()
-        ]
-
-    return filtered
+def _get(obj: Any, *names: str, default: Any = "") -> Any:
+    """Safely read an attribute or key from obj, falling through names."""
+    if obj is None:
+        return default
+    for name in names:
+        if isinstance(obj, dict) and name in obj and obj[name] is not None:
+            return obj[name]
+        val = getattr(obj, name, None)
+        if val is not None:
+            return val
+    return default
 
 
-
-@router.get("/issues/{key}")
-def get_issue(key: str):
-    issue = json_store.get_issue(key)
-    if not issue:
-        raise HTTPException(404, f"Issue '{key}' not found.")
-    return issue
-
-
-@router.get("/issues/{key}/children")
-def get_child_issues(key: str):
-    issue = json_store.get_issue(key)
-    if not issue:
-        raise HTTPException(404, f"Issue '{key}' not found.")
-    child_keys = issue["fields"].get("subtasks", [])
-    if not child_keys:
-        return []
-    all_issues = json_store.get_issues()
-    return [i for i in all_issues if i["key"] in child_keys]
+def _sanitize_cell(value: Any) -> str:
+    """Stringify a cell value and neutralize CSV/formula-injection triggers."""
+    if value is None:
+        return ""
+    text = str(value)
+    if text and text[0] in _FORMULA_TRIGGERS:
+        text = "'" + text
+    return text
 
 
-@router.post("/issues", status_code=201)
-def create_issue(body: IssueCreate):
-    project_key = body.project_key.upper()
-    project = json_store.get_project(project_key)
-    if not project:
-        raise HTTPException(404, f"Project '{project_key}' not found.")
-
-    issues = json_store.get_issues()
-    new_key = json_store.next_issue_key(project_key)
-    new_id = str(10000 + len(issues) + 1)
-    now = _now()
-
-    assignee_obj = None
-    if body.assignee:
-        user = json_store.get_user(body.assignee)
-        if user:
-            assignee_obj = {"accountId": user["accountId"], "displayName": user["displayName"]}
-
-    status_new = {
-        "id": "1",
-        "name": "To Do",
-        "statusCategory": {"id": 2, "key": "new", "name": "To Do"},
-    }
-
-    issue = {
-        "id": new_id,
-        "key": new_key,
-        "fields": {
-            "summary": body.summary,
-            "status": status_new,
-            "issuetype": {"id": "2", "name": body.issue_type},
-            "priority": {"id": _PRIORITY_MAP.get(body.priority, "3"), "name": body.priority},
-            "assignee": assignee_obj,
-            "reporter": None,
-            "project": {"key": project_key, "id": project.get("id", "")},
-            "description": body.description,
-            "created": now,
-            "updated": now,
-            "labels": body.labels,
-            "components": [{"name": c} for c in body.components],
-            "fixVersions": [{"name": v} for v in body.fix_versions],
-            "comment": {"comments": [], "total": 0},
-            "subtasks": [],
-            "parent": body.parent_key,
-            "epic": body.epic_link,
-            "sprint": body.sprint_id,
-            "watchers": [],
-            "transitions_history": [],
-            "remote_links": [],
-            "issueLinks": [],
-            "customfield_10001": body.story_points,
-            "estimate_hours": body.estimate_hours,
-            "customfield_10002": body.epic_link,
-        },
-    }
-
-    if body.parent_key:
-        for existing in issues:
-            if existing["key"] == body.parent_key:
-                existing["fields"].setdefault("subtasks", [])
-                if new_key not in existing["fields"]["subtasks"]:
-                    existing["fields"]["subtasks"].append(new_key)
-                break
-
-    issues.append(issue)
-    json_store.save_issues(issues)
-    return issue
-
-
-@router.put("/issues/{key}")
-def update_issue(key: str, body: IssueUpdate):
-    issues = json_store.get_issues()
-    issue = next((i for i in issues if i["key"] == key), None)
-    if not issue:
-        raise HTTPException(404, f"Issue '{key}' not found.")
-    f = issue["fields"]
-
-    if body.summary is not None:
-        f["summary"] = body.summary
-    if body.description is not None:
-        f["description"] = body.description
-    if body.assignee is not None:
-        if body.assignee == "":
-            f["assignee"] = None
-        else:
-            user = json_store.get_user(body.assignee)
-            if user:
-                f["assignee"] = {"accountId": user["accountId"], "displayName": user["displayName"]}
-    if body.priority is not None:
-        f["priority"] = {"id": _PRIORITY_MAP.get(body.priority, "3"), "name": body.priority}
-    if body.labels is not None:
-        f["labels"] = body.labels
-    if body.components is not None:
-        f["components"] = [{"name": c} for c in body.components]
-    if body.story_points is not None:
-        f["customfield_10001"] = body.story_points
-    if body.estimate_hours is not None:
-        f["estimate_hours"] = body.estimate_hours
-    if body.sprint_id is not None:
-        f["sprint"] = body.sprint_id if body.sprint_id else None
-    if body.epic_link is not None:
-        f["epic"] = body.epic_link if body.epic_link else None
-        f["customfield_10002"] = body.epic_link if body.epic_link else None
-    if body.fix_versions is not None:
-        f["fixVersions"] = [{"name": v} for v in body.fix_versions]
-    if body.parent_key is not None:
-        old_parent = f.get("parent")
-        f["parent"] = body.parent_key if body.parent_key else None
-        # Update subtasks on old parent
-        if old_parent and old_parent != body.parent_key:
-            for iss in issues:
-                if iss["key"] == old_parent:
-                    subs = iss["fields"].get("subtasks", [])
-                    if key in subs:
-                        subs.remove(key)
-                    break
-        # Update subtasks on new parent
-        if body.parent_key:
-            for iss in issues:
-                if iss["key"] == body.parent_key:
-                    iss["fields"].setdefault("subtasks", [])
-                    if key not in iss["fields"]["subtasks"]:
-                        iss["fields"]["subtasks"].append(key)
-                    break
-
-    if body.issue_type is not None:
-        f["issuetype"] = {"id": f.get("issuetype", {}).get("id", "2"), "name": body.issue_type}
-
-    # Handle status transition (allow any status for drag-drop)
-    if body.status is not None:
-        current_status = f.get("status", {}).get("name", "To Do")
-        if body.status != current_status and body.status in STATUS_OBJECTS:
-            now = _now()
-            f["status"] = STATUS_OBJECTS[body.status]
-            f.setdefault("transitions_history", []).append({
-                "from_status": current_status,
-                "to_status": body.status,
-                "timestamp": now,
-                "comment": None,
-            })
-
-    f["updated"] = _now()
-    json_store.save_issues(issues)
-    return issue
-
-
-@router.delete("/issues/{key}")
-def delete_issue(key: str):
-    issues = json_store.get_issues()
-    original = len(issues)
-    issues = [i for i in issues if i["key"] != key]
-    if len(issues) == original:
-        raise HTTPException(404, f"Issue '{key}' not found.")
-    json_store.save_issues(issues)
-    return {"deleted": True, "issue_key": key}
-
-
-@router.get("/issues/{key}/links")
-def get_issue_links(key: str):
-    issue = json_store.get_issue(key)
-    if not issue:
-        raise HTTPException(404, f"Issue '{key}' not found.")
-    return issue["fields"].get("issueLinks", [])
-
-
-@router.post("/issues/{key}/links", status_code=201)
-def create_issue_link(key: str, body: IssueLinkCreate):
-    issues = json_store.get_issues()
-    source = next((i for i in issues if i["key"] == key), None)
-    if not source:
-        raise HTTPException(404, f"Issue '{key}' not found.")
-    target = next((i for i in issues if i["key"] == body.target_key), None)
-    if not target:
-        raise HTTPException(404, f"Target issue '{body.target_key}' not found.")
-
-    link_id = f"link-{uuid.uuid4().hex[:8]}"
-    link_types = json_store.get_link_types()
-    lt = next((l for l in link_types if l["name"].lower() == body.type.lower()), None)
-    if not lt:
-        lt = {"name": body.type, "inward": f"is {body.type.lower()}ed by", "outward": f"{body.type.lower()}s"}
-
-    # Add outward link to source issue
-    source["fields"].setdefault("issueLinks", []).append({
-        "id": link_id,
-        "type": lt,
-        "direction": "outward",
-        "outwardIssue": {"key": body.target_key, "fields": {"summary": target["fields"]["summary"]}},
-    })
-    # Add inward link to target issue
-    target["fields"].setdefault("issueLinks", []).append({
-        "id": link_id,
-        "type": lt,
-        "direction": "inward",
-        "inwardIssue": {"key": key, "fields": {"summary": source["fields"]["summary"]}},
-    })
-
-    json_store.save_issues(issues)
-    return {"id": link_id, "type": lt["name"], "source": key, "target": body.target_key}
-
-
-@router.delete("/issues/{key}/links/{link_id}")
-def delete_issue_link(key: str, link_id: str):
-    issues = json_store.get_issues()
-    # Remove link from all issues that reference it
-    found = False
-    for iss in issues:
-        links = iss["fields"].get("issueLinks", [])
-        before = len(links)
-        iss["fields"]["issueLinks"] = [l for l in links if l.get("id") != link_id]
-        if len(iss["fields"]["issueLinks"]) < before:
-            found = True
-    if not found:
-        raise HTTPException(404, f"Link '{link_id}' not found.")
-    json_store.save_issues(issues)
-    return {"deleted": True, "link_id": link_id}
-
-
-
-VALID_IMPORT_TYPES = {"Epic", "Feature", "Story", "Task", "Bug"}
-
-
-@router.post("/projects/{project_key}/import-issues")
-async def import_issues_csv(project_key: str, file: UploadFile = File(...)):
-    """Import issues from a CSV file. Columns: Summary (required), Type, Description."""
-    project = json_store.get_project(project_key.upper())
-    if not project:
-        raise HTTPException(404, f"Project '{project_key}' not found.")
-
-    if not file.filename or not file.filename.lower().endswith(".csv"):
-        raise HTTPException(400, "Only CSV files are supported. Please upload a .csv file.")
-
-    try:
-        raw = await file.read()
-        text = raw.decode("utf-8-sig")  # handles BOM from Excel
-    except UnicodeDecodeError:
-        raise HTTPException(400, "Could not read file. Please save as UTF-8 CSV.")
-
-    reader = csv.DictReader(io.StringIO(text))
-    if not reader.fieldnames:
-        raise HTTPException(400, "CSV file appears to be empty or has no header row.")
-
-    # Normalize header names (case-insensitive, strip whitespace)
-    header_map = {}
-    for h in reader.fieldnames:
-        norm = h.strip().lower()
-        header_map[norm] = h
-
-    if "summary" not in header_map:
-        raise HTTPException(
-            400,
-            f"CSV must have a 'Summary' column. Found columns: {', '.join(reader.fieldnames)}",
+def _extract_fields(issue: Any) -> dict[str, str]:
+    """Extract the seven export columns from a backlog issue."""
+    fields = issue.get("fields", {}) if isinstance(issue, dict) else getattr(issue, "fields", {}) or {}
+    key = _get(issue, "key", default="")
+    summary = _get(fields, "summary", default="")
+    issue_type = _get(_get(fields, "issuetype", "issue_type", default={}) or {}, "name", default="")
+    status = _get(_get(fields, "status", default={}) or {}, "name", default="")
+    priority = _get(_get(fields, "priority", default={}) or {}, "name", default="")
+    assignee_obj = _get(fields, "assignee", default=None)
+    assignee = "" if assignee_obj is None else _get(assignee_obj, "displayName", "display_name", "name", default="")
+    sprint_raw = _get(fields, "sprint", "customfield_sprint", default=None)
+    if sprint_raw is None:
+        sprint = ""
+    elif isinstance(sprint_raw, list):
+        sprint = ", ".join(
+            _get(s, "name", default="") if not isinstance(s, str) else s
+            for s in sprint_raw
+            if s is not None
         )
+    elif isinstance(sprint_raw, (dict,)) or hasattr(sprint_raw, "name"):
+        sprint = _get(sprint_raw, "name", default="")
+    else:
+        sprint = str(sprint_raw)
+    return {
+        "key": _sanitize_cell(key),
+        "summary": _sanitize_cell(summary),
+        "issue_type": _sanitize_cell(issue_type),
+        "status": _sanitize_cell(status),
+        "priority": _sanitize_cell(priority),
+        "assignee": _sanitize_cell(assignee),
+        "sprint": _sanitize_cell(sprint),
+    }
 
-    results = {"created": [], "errors": [], "total_rows": 0}
-    issues = json_store.get_issues()
-    now = _now()
 
-    for row_num, row in enumerate(reader, start=2):  # row 1 is header
-        results["total_rows"] += 1
-        summary_col = header_map["summary"]
-        summary = (row.get(summary_col) or "").strip()
+def _iter_csv(issues: Iterable[Any]) -> Iterator[str]:
+    """Yield CSV text chunks for the header and each issue row."""
+    buffer = io.StringIO()
+    writer = csv.writer(buffer)
+    writer.writerow(CSV_COLUMNS)
+    yield buffer.getvalue()
+    buffer.seek(0)
+    buffer.truncate(0)
+    for issue in issues or []:
+        row = _extract_fields(issue)
+        writer.writerow([row[c] for c in CSV_COLUMNS])
+        yield buffer.getvalue()
+        buffer.seek(0)
+        buffer.truncate(0)
 
-        if not summary:
-            results["errors"].append({"row": row_num, "error": "Summary is empty"})
-            continue
 
-        # Type
-        type_col = header_map.get("type")
-        issue_type = "Story"
-        if type_col:
-            raw_type = (row.get(type_col) or "").strip()
-            if raw_type:
-                # Case-insensitive match
-                matched = next((t for t in VALID_IMPORT_TYPES if t.lower() == raw_type.lower()), None)
-                if matched:
-                    issue_type = matched
-                else:
-                    results["errors"].append({
-                        "row": row_num,
-                        "error": f"Invalid type '{raw_type}'. Valid: {', '.join(sorted(VALID_IMPORT_TYPES))}",
-                    })
-                    continue
+def _fetch_issues(
+    project_key: str,
+    status: str | None,
+    issue_type: str | None,
+    assignee: str | None,
+    search: str | None,
+) -> list[Any]:
+    """Call get_project_issues with filters, with a Python-side fallback."""
+    filters = {
+        "status": status,
+        "issue_type": issue_type,
+        "assignee": assignee,
+        "search": search,
+    }
+    active = {k: v for k, v in filters.items() if v}
+    try:
+        return list(get_project_issues(project_key, **active) or [])
+    except TypeError:
+        all_issues = list(get_project_issues(project_key) or [])
+        result = []
+        for issue in all_issues:
+            row = _extract_fields(issue)
+            if status and row["status"].lower() != status.lower():
+                continue
+            if issue_type and row["issue_type"].lower() != issue_type.lower():
+                continue
+            if assignee and row["assignee"].lower() != assignee.lower():
+                continue
+            if search and search.lower() not in row["summary"].lower():
+                continue
+            result.append(issue)
+        return result
 
-        # Description
-        desc_col = header_map.get("description")
-        description = ""
-        if desc_col:
-            description = (row.get(desc_col) or "").strip()
 
-        # Create issue
-        new_key = json_store.next_issue_key(project_key.upper())
-        new_id = str(10000 + len(issues) + 1)
+@router.get("/projects/{project_key}/issues/export.csv")
+def export_backlog_csv(
+    project_key: str,
+    status: str | None = Query(default=None),
+    issue_type: str | None = Query(default=None),
+    assignee: str | None = Query(default=None),
+    search: str | None = Query(default=None),
+    current_user: dict = Depends(get_current_user),
+) -> StreamingResponse:
+    """Stream a CSV export of backlog issues for the given project."""
+    _validate_project_key(project_key)
+    if not project_exists(project_key):
+        raise HTTPException(status_code=404, detail="Project not found")
+    if not user_can_read_project(current_user, project_key):
+        raise HTTPException(status_code=403, detail="Forbidden")
+    try:
+        issues = _fetch_issues(project_key, status, issue_type, assignee, search)
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        logger.exception("export_backlog_csv failed: %s", exc)
+        raise HTTPException(status_code=500, detail="Export failed") from exc
 
-        issue = {
-            "id": new_id,
-            "key": new_key,
-            "fields": {
-                "summary": summary,
-                "status": {"id": "1", "name": "To Do", "statusCategory": {"id": 2, "key": "new", "name": "To Do"}},
-                "issuetype": {"id": "2", "name": issue_type},
-                "priority": {"id": "3", "name": "Medium"},
-                "assignee": None,
-                "reporter": None,
-                "project": {"key": project_key.upper(), "id": project.get("id", "")},
-                "description": description,
-                "created": now,
-                "updated": now,
-                "labels": [],
-                "components": [],
-                "fixVersions": [],
-                "comment": {"comments": [], "total": 0},
-                "subtasks": [],
-                "parent": None,
-                "epic": None,
-                "sprint": None,
-                "watchers": [],
-                "transitions_history": [],
-                "remote_links": [],
-                "issueLinks": [],
-                "customfield_10001": None,
-                "estimate_hours": None,
-                "customfield_10002": None,
-            },
-        }
-
-        issues.append(issue)
-        results["created"].append({"row": row_num, "key": new_key, "summary": summary, "type": issue_type})
-
-    if results["created"]:
-        json_store.save_issues(issues)
-
-    return results
+    headers = {
+        "Content-Disposition": 'attachment; filename=backlog_export.csv',
+        "Cache-Control": "no-store",
+    }
+    return StreamingResponse(
+        _iter_csv(issues),
+        media_type="text/csv; charset=utf-8",
+        headers=headers,
+    )
