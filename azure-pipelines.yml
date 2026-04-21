@@ -1,0 +1,220 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# PMTracker — Azure Pipelines CI/CD
+#
+# Stages
+#   1. build  — lint, test, and produce a deployable artifact
+#   2. deploy — push artifact to Azure App Service (no service connection needed)
+#
+# Required pipeline secret variable (Azure DevOps → Pipelines → Variables):
+#
+#   PUBLISH_PROFILE  — full XML content of the App Service publish profile.
+#
+#   How to get it:
+#     Azure Portal → cogniteer-pmtracker App Service
+#       → Deployment Center → Manage publish profile → Download
+#     Open the downloaded .PublishSettings file, copy ALL the XML text,
+#     paste it as a secret pipeline variable named PUBLISH_PROFILE.
+# ─────────────────────────────────────────────────────────────────────────────
+
+trigger:
+  branches:
+    include:
+      - main
+      - develop
+  paths:
+    exclude:
+      - "*.md"
+      - docs/**
+
+pr:
+  branches:
+    include:
+      - main
+      - develop
+
+variables:
+  pythonVersion: "3.11"
+  nodeVersion: "20.x"
+  artifactName: "pmtracker-drop"
+  WEBAPP_NAME: "cogniteer-pmtracker"
+  WEBAPP_URL: "https://cogniteer-pmtracker-endtbufkcdbbf5fj.southindia-01.azurewebsites.net"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 1 — Build & Test
+# ─────────────────────────────────────────────────────────────────────────────
+stages:
+  - stage: Build
+    displayName: "Build & Test"
+    jobs:
+
+      # ── Python backend ──────────────────────────────────────────────────────
+      - job: BackendCI
+        displayName: "Python — lint & test"
+        pool:
+          vmImage: ubuntu-latest
+
+        steps:
+          - task: UsePythonVersion@0
+            displayName: "Use Python $(pythonVersion)"
+            inputs:
+              versionSpec: $(pythonVersion)
+              addToPath: true
+
+          - script: pip install --upgrade pip
+            displayName: "Upgrade pip"
+
+          - script: pip install -r requirements.txt
+            displayName: "Install runtime dependencies"
+
+          # Optional: add ruff/flake8 here if you adopt a linter
+          # - script: pip install ruff && ruff check .
+          #   displayName: "Lint (ruff)"
+
+      # ── React / Vite frontend ───────────────────────────────────────────────
+      - job: FrontendBuild
+        displayName: "Node — build UI"
+        pool:
+          vmImage: ubuntu-latest
+
+        steps:
+          - task: NodeTool@0
+            displayName: "Use Node $(nodeVersion)"
+            inputs:
+              versionSpec: $(nodeVersion)
+
+          - script: npm ci
+            workingDirectory: ui
+            displayName: "npm ci"
+
+          - script: npm run build
+            workingDirectory: ui
+            displayName: "Vite build"
+
+          - task: CopyFiles@2
+            displayName: "Stage ui/dist"
+            inputs:
+              SourceFolder: ui/dist
+              Contents: "**"
+              TargetFolder: $(Build.ArtifactStagingDirectory)/ui/dist
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish ui/dist artifact"
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/ui/dist
+              artifact: ui-dist
+
+      # ── Assemble deployment package ─────────────────────────────────────────
+      - job: Package
+        displayName: "Assemble deployment artifact"
+        dependsOn:
+          - BackendCI
+          - FrontendBuild
+        pool:
+          vmImage: ubuntu-latest
+
+        steps:
+          # Re-download built UI
+          - task: DownloadPipelineArtifact@2
+            displayName: "Download ui/dist artifact"
+            inputs:
+              artifact: ui-dist
+              path: $(Pipeline.Workspace)/ui/dist
+
+          # Copy everything except dev-only dirs into staging
+          - task: CopyFiles@2
+            displayName: "Stage backend sources"
+            inputs:
+              Contents: |
+                **
+                !ui/**
+                !tests/**
+                !.git/**
+                !**/__pycache__/**
+                !**/*.pyc
+              TargetFolder: $(Build.ArtifactStagingDirectory)/app
+
+          # Put the pre-built UI back in the package
+          - task: CopyFiles@2
+            displayName: "Stage pre-built UI"
+            inputs:
+              SourceFolder: $(Pipeline.Workspace)/ui/dist
+              Contents: "**"
+              TargetFolder: $(Build.ArtifactStagingDirectory)/app/ui/dist
+
+          - task: ArchiveFiles@2
+            displayName: "Zip deployment package"
+            inputs:
+              rootFolderOrFile: $(Build.ArtifactStagingDirectory)/app
+              includeRootFolder: false
+              archiveType: zip
+              archiveFile: $(Build.ArtifactStagingDirectory)/$(artifactName).zip
+              replaceExistingArchive: true
+
+          - task: PublishPipelineArtifact@1
+            displayName: "Publish deployment zip"
+            inputs:
+              targetPath: $(Build.ArtifactStagingDirectory)/$(artifactName).zip
+              artifact: $(artifactName)
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stage 2 — Deploy to Azure App Service
+# ─────────────────────────────────────────────────────────────────────────────
+  - stage: Deploy
+    displayName: "Deploy to Azure App Service"
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+
+    jobs:
+      - deployment: DeployWeb
+        displayName: "Deploy $(WEBAPP_NAME)"
+        environment: production
+        pool:
+          vmImage: ubuntu-latest
+
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - task: DownloadPipelineArtifact@2
+                  displayName: "Download deployment zip"
+                  inputs:
+                    artifact: $(artifactName)
+                    path: $(Pipeline.Workspace)/drop
+
+                - script: |
+                    printf '%s' "$PUBLISH_PROFILE" > /tmp/pp.xml
+                    KUDU_USER=$(grep -oP 'userName="\K[^"]+' /tmp/pp.xml | head -1)
+                    KUDU_PASS=$(grep -oP 'userPWD="\K[^"]+' /tmp/pp.xml | head -1)
+                    # Derive Kudu SCM host from WEBAPP_URL by inserting .scm after the
+                    # first hostname segment.  Works for both classic and new-style URLs:
+                    #   classic:  myapp.azurewebsites.net          → myapp.scm.azurewebsites.net
+                    #   new-style: myapp-abc123.region-01.azurewebsites.net → myapp-abc123.scm.region-01.azurewebsites.net
+                    WEBAPP_HOST=$(echo "$(WEBAPP_URL)" | sed 's|https://||' | sed 's|/$||')
+                    KUDU_HOST="${WEBAPP_HOST/\./.scm.}"
+                    if [ -z "$KUDU_USER" ] || [ -z "$KUDU_PASS" ]; then
+                      echo "##[error]Could not extract credentials from PUBLISH_PROFILE. Verify the pipeline secret variable is set."
+                      exit 1
+                    fi
+                    echo "Deploying to https://$KUDU_HOST ..."
+                    curl -X POST \
+                      "https://$KUDU_HOST/api/zipdeploy?isAsync=true" \
+                      -u "$KUDU_USER:$KUDU_PASS" \
+                      --data-binary @$(Pipeline.Workspace)/drop/$(artifactName).zip \
+                      --fail --show-error
+                  displayName: "Deploy to App Service (Kudu ZIP)"
+                  env:
+                    PUBLISH_PROFILE: $(PUBLISH_PROFILE)
+
+                # ── Post-deploy smoke test ───────────────────────────────────
+                - script: |
+                    BASE="$(WEBAPP_URL)"
+                    echo "Pinging $BASE/api/health ..."
+                    for i in 1 2 3 4 5; do
+                      STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/api/health")
+                      echo "Attempt $i: HTTP $STATUS"
+                      [ "$STATUS" = "200" ] && exit 0
+                      sleep 10
+                    done
+                    echo "Health check failed after 5 attempts"
+                    exit 1
+                  displayName: "Smoke test — /api/health"
