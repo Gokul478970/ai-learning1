@@ -1,96 +1,119 @@
+import { getToken, clearSession } from '@/lib/auth'
 
-export type BacklogItem = {
-  key: string
-  fields?: {
-    summary?: string
-    issuetype?: { name?: string }
-    status?: { name?: string }
-    priority?: { name?: string }
-    assignee?: { displayName?: string } | null
-    reporter?: { displayName?: string } | null
-    customfield_10001?: number | null
-    sprint?: string | { name?: string } | null
-    labels?: string[]
-    components?: Array<{ name?: string }>
-    fixVersions?: Array<{ name?: string }>
-    created?: string
-    updated?: string
-    description?: string
+const BASE = '/api'
+
+/**
+ * Parse filename from Content-Disposition header. Falls back to default.
+ */
+export function parseFilenameFromContentDisposition(
+  header: string | null,
+  fallback: string = 'backlog_export.csv',
+): string {
+  if (!header) return fallback
+  // RFC 5987: filename*=UTF-8''...
+  const starMatch = /filename\*=(?:UTF-8'')?([^;]+)/i.exec(header)
+  if (starMatch && starMatch[1]) {
+    try {
+      return decodeURIComponent(starMatch[1].trim().replace(/^"|"$/g, ''))
+    } catch {
+      // fall through
+    }
   }
+  const match = /filename="?([^";]+)"?/i.exec(header)
+  if (match && match[1]) return match[1].trim()
+  return fallback
 }
 
-export const EXPORT_COLUMNS = [
-  'Issue Key',
-  'Summary',
-  'Issue Type',
-  'Status',
-  'Priority',
-  'Assignee',
-  'Reporter',
-  'Story Points',
-  'Sprint',
-  'Labels',
-  'Components',
-  'Fix Version/s',
-  'Created',
-  'Updated',
-  'Description',
-]
-
-export function stripHtml(input: string): string {
-  return (input || '').replace(/<[^>]*>/g, '')
+/**
+ * Trigger a browser download of the given Blob using an anchor + object URL.
+ */
+export function triggerCsvBlobDownload(blob: Blob, filename: string): void {
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.style.display = 'none'
+  document.body.appendChild(a)
+  a.click()
+  document.body.removeChild(a)
+  // Revoke shortly after click so browser has time to start download.
+  setTimeout(() => URL.revokeObjectURL(url), 0)
 }
 
-export function mapIssueToRow(issue: BacklogItem): Record<string, string | number> {
-  const f = issue.fields || {}
-  const sprint = typeof f.sprint === 'string' ? f.sprint : (f.sprint?.name || '')
-  return {
-    'Issue Key': issue.key || '',
-    'Summary': f.summary || '',
-    'Issue Type': f.issuetype?.name || '',
-    'Status': f.status?.name || '',
-    'Priority': f.priority?.name || '',
-    'Assignee': f.assignee?.displayName || '',
-    'Reporter': f.reporter?.displayName || '',
-    'Story Points': f.customfield_10001 ?? '',
-    'Sprint': sprint,
-    'Labels': (f.labels || []).join(', '),
-    'Components': (f.components || []).map((c) => c.name || '').filter(Boolean).join(', '),
-    'Fix Version/s': (f.fixVersions || []).map((v) => v.name || '').filter(Boolean).join(', '),
-    'Created': f.created || '',
-    'Updated': f.updated || '',
-    'Description': stripHtml(f.description || ''),
+/**
+ * Sentinel thrown on 401 so callers (e.g. ExportCSVButton) can suppress
+ * the transient error message while the page reloads.
+ */
+export class SessionExpiredError extends Error {
+  constructor() {
+    super('Session expired')
+    this.name = 'SessionExpiredError'
   }
 }
 
 /**
- * Generate the export filename with the pattern backlog-export-YYYY-MM-DD.csv
- * Uses UTC date methods to match the backend's UTC-based filename generation.
+ * Call the backend backlog CSV export endpoint and trigger a download.
+ * Forwards the current project key + active filters as query params.
+ *
+ * On 401: clears session and reloads the page (consistent with api.ts);
+ * throws SessionExpiredError which the UI swallows silently.
  */
-export function getExportFilename(date?: Date, extension: 'csv' | 'xlsx' = 'xlsx'): string {
-  const d = date || new Date();
-  const year = d.getUTCFullYear();
-  const month = String(d.getUTCMonth() + 1).padStart(2, "0");
-  const day = String(d.getUTCDate()).padStart(2, "0");
-  return `backlog-export-${year}-${month}-${day}.${extension}`;
-}
+export async function downloadBacklogCsv(
+  projectKey: string,
+  filters: Record<string, string | undefined | null>,
+): Promise<void> {
+  if (!projectKey) throw new Error('No project selected')
 
-/**
- * Legacy XLSX export function. The XLSX library is loaded dynamically on
- * demand so it does not increase the initial bundle size.
- */
-export async function exportBacklogToXlsx(items: BacklogItem[], onEmpty?: () => void): Promise<boolean> {
-  if (!items || items.length === 0) {
-    onEmpty?.()
-    return false
+  // Build query string, dropping empty/null/undefined values.
+  const qs = new URLSearchParams()
+  for (const [k, v] of Object.entries(filters || {})) {
+    if (v !== undefined && v !== null && String(v).length > 0) {
+      qs.append(k, String(v))
+    }
+  }
+  const query = qs.toString()
+  const url = `${BASE}/projects/${encodeURIComponent(projectKey)}/issues/export${
+    query ? `?${query}` : ''
+  }`
+
+  const token = getToken()
+  const headers: Record<string, string> = {}
+  if (token) headers['Authorization'] = `Bearer ${token}`
+
+  let res: Response
+  try {
+    res = await fetch(url, { method: 'GET', headers })
+  } catch (e: any) {
+    throw new Error(e?.message || 'Network error while exporting backlog')
   }
 
-  const XLSX = await import('xlsx')
-  const rows = items.map(mapIssueToRow)
-  const ws = XLSX.utils.json_to_sheet(rows, { header: EXPORT_COLUMNS })
-  const wb = XLSX.utils.book_new()
-  XLSX.utils.book_append_sheet(wb, ws, 'Backlog')
-  XLSX.writeFile(wb, getExportFilename(undefined, 'xlsx'))
-  return true
-}
+  if (res.status === 401) {
+    // Consistent with ui/src/lib/api.ts pattern.
+    clearSession()
+    try {
+      window.location.reload()
+    } catch {
+      // ignore in non-browser/test envs
+    }
+    // Throw a sentinel so the caller can suppress UI error surfacing.
+    throw new SessionExpiredError()
+  }
 
+  if (!res.ok) {
+    let detail = res.statusText
+    try {
+      const body = await res.json()
+      if (body && typeof body.detail === 'string') detail = body.detail
+    } catch {
+      // body was not JSON; keep statusText
+    }
+    throw new Error(detail || `Export failed (${res.status})`)
+  }
+
+  const blob = await res.blob()
+  const filename = parseFilenameFromContentDisposition(
+    res.headers.get('Content-Disposition'),
+    'backlog_export.csv',
+  )
+  triggerCsvBlobDownload(blob, filename)
+}
